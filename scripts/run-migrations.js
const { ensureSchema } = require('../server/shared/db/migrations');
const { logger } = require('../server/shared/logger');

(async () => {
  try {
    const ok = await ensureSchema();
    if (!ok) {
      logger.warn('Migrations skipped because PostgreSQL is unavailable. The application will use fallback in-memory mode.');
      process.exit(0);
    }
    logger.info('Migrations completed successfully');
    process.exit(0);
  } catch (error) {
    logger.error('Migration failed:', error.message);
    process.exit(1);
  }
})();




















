@@ -1,0 +1,283 @@
+const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
+const { logger } = require('../shared/logger');
+const env = require('../shared/config/env');
+const { getPlayerProfile, savePlayerProfile, savePlayerSession, deletePlayerSession } = require('../shared/services/playerRepository');
+
+function buildPlayerShell(playerId) {
+  return {
+    playerId,
+    username: playerId,
+    money: 0,
+    level: 1,
+    xp: 0,
+    inventory: [],
+    worldName: 'spawn',
+  };
+}
+
+async function createGameServer(options = {}) {
+  const app = express();
+  const port = options.port || env.GAME_SERVER_PORT;
+  const host = options.host || env.GAME_SERVER_HOST;
+  const serverId = options.serverId || env.SERVER_ID;
+  const gatewayUrl = options.gatewayUrl || env.GATEWAY_URL;
+  const maxPlayers = Number(options.maxPlayers || env.GAME_SERVER_MAX_PLAYERS);
+  const heartbeatInterval = Number(options.heartbeatInterval || env.GAME_SERVER_HEARTBEAT_INTERVAL);
+  const activeSessions = new Map();
+  const state = {
+    serverId,
+    host,
+    port,
+    maxPlayers,
+    currentPlayers: 0,
+    status: 'online',
+  };
+
+  app.use(express.json());
+
+  app.get('/health', (req, res) => {
+    res.json({
+      status: 'ok',
+      service: 'game-server',
+      serverId,
+      currentPlayers: state.currentPlayers,
+      maxPlayers: state.maxPlayers,
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  app.get('/status', (req, res) => {
+    res.json({
+      serverId,
+      host,
+      port,
+      currentPlayers: state.currentPlayers,
+      maxPlayers,
+      status: state.status,
+      connectedPlayers: [...activeSessions.values()].map((session) => session.playerId),
+    });
+  });
+
+  app.get('/players', (req, res) => {
+    res.json({
+      serverId,
+      players: [...activeSessions.values()].map((session) => ({
+        playerId: session.playerId,
+        username: session.username,
+        worldName: session.worldName,
+      })),
+    });
+  });
+
+  app.post('/save-player', async (req, res) => {
+    const player = req.body || {};
+    const saved = await savePlayerProfile({
+      ...player,
+      playerId: player.playerId || player.player_id,
+      inventory: player.inventory || [],
+    });
+    res.json({ ok: true, player: saved });
+  });
+
+  const serverInstance = http.createServer(app);
+  const wsServer = new WebSocket.Server({ server: serverInstance, path: '/ws' });
+
+  function sendJson(ws, payload) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(payload));
+    }
+  }
+
+  async function registerWithGateway() {
+    if (options.skipGatewayRegistration) return;
+
+    try {
+      const response = await fetch(`${gatewayUrl}/register-server`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          serverId,
+          host,
+          port,
+          maxPlayers,
+          currentPlayers: state.currentPlayers,
+          status: state.status,
+        }),
+      });
+
+      if (!response.ok) {
+        logger.warn(`Registration failed with gateway. Status: ${response.status}`);
+      }
+    } catch (error) {
+      logger.warn(`Gateway registration failed: ${error.message}`);
+    }
+  }
+
+  async function heartbeatToGateway() {
+    if (options.skipGatewayRegistration) return;
+
+    try {
+      const response = await fetch(`${gatewayUrl}/heartbeat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          serverId,
+          host,
+          port,
+          maxPlayers,
+          currentPlayers: state.currentPlayers,
+          status: state.status,
+          connectedPlayers: [...activeSessions.values()].map((session) => session.playerId),
+        }),
+      });
+
+      if (!response.ok) {
+        logger.warn(`Heartbeat failed. Gateway responded with ${response.status}`);
+      }
+    } catch (error) {
+      logger.warn(`Heartbeat failed: ${error.message}`);
+    }
+  }
+
+  wsServer.on('connection', (ws, req) => {
+    const url = new URL(req.url, 'http://localhost');
+    const token = url.searchParams.get('token');
+    const playerId = url.searchParams.get('playerId') || `guest-${Date.now()}`;
+
+    logger.info(`Incoming WebSocket connection from ${playerId}`);
+
+    ws.on('message', async (raw) => {
+      try {
+        const message = JSON.parse(raw.toString());
+
+        if (message.type === 'ping') {
+          sendJson(ws, { type: 'pong', serverId, timestamp: new Date().toISOString() });
+          return;
+        }
+
+        if (message.type === 'auth') {
+          const profile = await getPlayerProfile(message.playerId || playerId) || buildPlayerShell(message.playerId || playerId);
+          activeSessions.set(ws, {
+            playerId: profile.playerId,
+            username: profile.username,
+            worldName: profile.worldName,
+            token,
+          });
+          state.currentPlayers = activeSessions.size;
+
+          await savePlayerSession({
+            playerId: profile.playerId,
+            serverId,
+            token,
+            username: profile.username,
+            worldName: profile.worldName,
+            startedAt: new Date().toISOString(),
+          });
+
+          sendJson(ws, { type: 'welcome', serverId, player: profile });
+          return;
+        }
+
+        if (message.type === 'player:move') {
+          const session = activeSessions.get(ws);
+          if (!session) {
+            sendJson(ws, { type: 'error', message: 'Session not authenticated' });
+            return;
+          }
+
+          const player = await getPlayerProfile(session.playerId) || buildPlayerShell(session.playerId);
+          const updated = {
+            ...player,
+            worldName: message.worldName || player.worldName,
+            position: message.position || player.position,
+          };
+          await savePlayerProfile(updated);
+          sendJson(ws, { type: 'player:sync', player: updated, serverId });
+          return;
+        }
+
+        if (message.type === 'save') {
+          const session = activeSessions.get(ws);
+          if (!session) {
+            sendJson(ws, { type: 'error', message: 'Session not authenticated' });
+            return;
+          }
+
+          const saved = await savePlayerProfile({
+            ...buildPlayerShell(session.playerId),
+            ...message.player,
+            playerId: session.playerId,
+          });
+          sendJson(ws, { type: 'save:success', player: saved });
+          return;
+        }
+
+        sendJson(ws, { type: 'ack', serverId, received: true });
+      } catch (error) {
+        logger.error('WebSocket message handling failed:', error.message);
+        sendJson(ws, { type: 'error', message: error.message });
+      }
+    });
+
+    ws.on('close', async () => {
+      const session = activeSessions.get(ws);
+      if (session) {
+        await deletePlayerSession(session.playerId);
+        logger.info(`Player disconnected from server: ${session.playerId}`);
+      }
+      activeSessions.delete(ws);
+      state.currentPlayers = activeSessions.size;
+    });
+  });
+
+  const shutdown = async (signal) => {
+    logger.info(`Graceful shutdown received (${signal})`);
+    state.status = 'shutting_down';
+    for (const [ws] of activeSessions.entries()) {
+      sendJson(ws, { type: 'server:shutdown', message: 'Server is shutting down' });
+      ws.close();
+    }
+
+    await new Promise((resolve) => serverInstance.close(resolve));
+    logger.info(`Game server ${serverId} stopped gracefully`);
+    process.exit(0);
+  };
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  await new Promise((resolve, reject) => {
+    serverInstance.once('error', reject);
+    serverInstance.listen(port, host, () => {
+      logger.info(`Game server ${serverId} listening on ${host}:${port}`);
+      resolve();
+    });
+  });
+
+  await registerWithGateway();
+  const heartbeatLoop = setInterval(() => {
+    heartbeatToGateway().catch((error) => logger.warn('Failed to send heartbeat:', error.message));
+  }, heartbeatInterval);
+
+  return {
+    app,
+    server: serverInstance,
+    wsServer,
+    state,
+    close: async () => {
+      clearInterval(heartbeatLoop);
+      await shutdown('MANUAL');
+    },
+  };
+}
+
+if (require.main === module) {
+  createGameServer().catch((error) => {
+    logger.error('Game server failed to start:', error.message);
+    process.exit(1);
+  });
+}
+
+module.exports = { createGameServer, buildPlayerShell };

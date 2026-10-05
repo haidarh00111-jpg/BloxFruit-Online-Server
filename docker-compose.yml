@@ -1,0 +1,104 @@
+version: '3.9'
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    container_name: blox-gateway
+    env_file:
+      - .env.example
+    environment:
+      GATEWAY_PORT: 3000
+      GATEWAY_HOST: 0.0.0.0
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: bloxfruit
+    ports:
+      - "3000:3000"
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  game-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.game
+    container_name: blox-game-1
+    env_file:
+      - .env.example
+    environment:
+      SERVER_ID: game-1
+      GAME_SERVER_PORT: 3001
+      GATEWAY_URL: http://gateway:3000
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: bloxfruit
+    ports:
+      - "3001:3001"
+    depends_on:
+      - gateway
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  game-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.game
+    container_name: blox-game-2
+    env_file:
+      - .env.example
+    environment:
+      SERVER_ID: game-2
+      GAME_SERVER_PORT: 3002
+      GATEWAY_URL: http://gateway:3000
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: bloxfruit
+    ports:
+      - "3002:3002"
+    depends_on:
+      - gateway
+      - redis
+      - postgres
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: blox-redis
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: blox-postgres
+    environment:
+      POSTGRES_DB: bloxfruit
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  postgres-data:
